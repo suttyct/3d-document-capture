@@ -20,6 +20,7 @@ Today's capture SDKs treat the camera feed as a stream of flat pictures and emit
 | [docs/02-architecture.md](docs/02-architecture.md) | The proposed technical architecture: the 3D scene model, perception pipeline, document-space defect localization, multi-frame quality accumulator, capture state machine, and platform stacks. |
 | [docs/03-ux-blueprint.md](docs/03-ux-blueprint.md) | The "25th-century" capture experience: choreography, AR overlay language, coaching grammar, haptics/sound, accessibility, fallbacks, and success metrics. |
 | [docs/04-risks-and-open-questions.md](docs/04-risks-and-open-questions.md) | Patent landscape, unverified claims to re-check, technical risks, and the proposed proof-of-concept sequence. |
+| [mockup/index.html](mockup/index.html) | High-fidelity animated prototype of the capture experience (self-contained HTML — open in any browser; auto-plays all seven scenes, or step through them). Rendered stills in [mockup/shots/](mockup/shots/). |
 
 ## Headline design decisions (detailed in the docs)
 
