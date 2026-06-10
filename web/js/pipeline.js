@@ -38,7 +38,7 @@
     minAreaFrac: 0.05,         // quad must cover >= 5% of frame
     maxAreaFrac: 0.95,
     approxEpsFrac: 0.03,       // approxPolyDP epsilon as fraction of perimeter
-    aspectMin: 1.25, aspectMax: 2.15,   // ID-1 = 1.586
+    aspectMin: 1.15, aspectMax: 2.6,    // ID-1 = 1.586; tilt compresses apparent aspect
     glareValMin: 246,          // HSV V threshold (true glare is blown out, not just bright)
     glareSatMax: 60,           // HSV S threshold
     glareZoneFracBad: 0.04,    // zone is "glared" if > 4% of its pixels glare
@@ -74,6 +74,8 @@
 
   /**
    * Detect the document quadrangle in an RGBA frame Mat.
+   * Tries Canny edges first; falls back to Otsu binarization (handles soft
+   * edges / low local contrast where Canny fragments).
    * Returns { corners:[tl,tr,br,bl] in FULL-frame px, score, areaFrac } or null.
    */
   function detectQuad(srcRGBA, cfg = CONFIG) {
@@ -81,18 +83,45 @@
     const scale = cfg.analysisWidth / fw;
     const aw = Math.round(fw * scale), ah = Math.round(fh * scale);
 
-    const small = new cv.Mat(), gray = new cv.Mat(), edges = new cv.Mat();
+    const small = new cv.Mat(), gray = new cv.Mat();
     cv.resize(srcRGBA, small, new cv.Size(aw, ah), 0, 0, cv.INTER_AREA);
     cv.cvtColor(small, gray, cv.COLOR_RGBA2GRAY);
     cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0);
-    cv.Canny(gray, edges, cfg.cannyLo, cfg.cannyHi);
+
     const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
-    cv.dilate(edges, edges, kernel);
-    kernel.delete();
+    let best = null;
 
+    // strategy 1: Canny edges
+    {
+      const edges = new cv.Mat();
+      cv.Canny(gray, edges, cfg.cannyLo, cfg.cannyHi);
+      cv.dilate(edges, edges, kernel);
+      best = bestQuadFromBinary(edges, aw, ah, cfg);
+      edges.delete();
+    }
+    // strategy 2: Otsu threshold (bright card on darker surface or vice versa)
+    if (!best) {
+      const bin = new cv.Mat();
+      cv.threshold(gray, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+      best = bestQuadFromBinary(bin, aw, ah, cfg);
+      if (!best) {
+        cv.bitwise_not(bin, bin);
+        best = bestQuadFromBinary(bin, aw, ah, cfg);
+      }
+      bin.delete();
+    }
+    kernel.delete(); small.delete(); gray.delete();
+
+    if (!best) return null;
+    let corners = best.ordered.map(p => ({ x: p.x / scale, y: p.y / scale }));
+    corners = refineCorners(srcRGBA, corners);
+    return { corners, score: best.score, areaFrac: best.areaFrac };
+  }
+
+  /** Find the best card-like quad in a binary/edge image. */
+  function bestQuadFromBinary(binary, aw, ah, cfg) {
     const contours = new cv.MatVector(), hier = new cv.Mat();
-    cv.findContours(edges, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-
+    cv.findContours(binary, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
     let best = null;
     const frameArea = aw * ah;
     for (let i = 0; i < contours.size(); i++) {
@@ -113,7 +142,6 @@
           const hL = dist(ordered[0], ordered[3]), hR = dist(ordered[1], ordered[2]);
           const aspect = ((wTop + wBot) / 2) / Math.max(1, (hL + hR) / 2);
           if (aspect >= cfg.aspectMin && aspect <= cfg.aspectMax) {
-            // rectangularity: contour area vs quad area
             const cArea = cv.contourArea(cnt);
             const rectangularity = cArea / Math.max(1, area);
             const score = areaFrac * rectangularity;
@@ -123,12 +151,8 @@
       }
       approx.delete(); cnt.delete();
     }
-    contours.delete(); hier.delete(); small.delete(); gray.delete(); edges.delete();
-
-    if (!best) return null;
-    let corners = best.ordered.map(p => ({ x: p.x / scale, y: p.y / scale }));
-    corners = refineCorners(srcRGBA, corners);
-    return { corners, score: best.score, areaFrac: best.areaFrac };
+    contours.delete(); hier.delete();
+    return best;
   }
 
   /** Sub-pixel corner refinement on the full-res frame (corrects the
@@ -155,20 +179,25 @@
     }
   }
 
-  /** Rectify the document into UV space. Returns a new RGBA Mat (UV_W x UV_H). */
-  function rectify(srcRGBA, corners) {
+  /** Rectify the document into an arbitrary-resolution raster. */
+  function rectifyTo(srcRGBA, corners, outW, outH) {
     const srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
       corners[0].x, corners[0].y, corners[1].x, corners[1].y,
       corners[2].x, corners[2].y, corners[3].x, corners[3].y,
     ]);
     const dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
-      0, 0, UV_W, 0, UV_W, UV_H, 0, UV_H,
+      0, 0, outW, 0, outW, outH, 0, outH,
     ]);
     const H = cv.getPerspectiveTransform(srcTri, dstTri);
     const uv = new cv.Mat();
-    cv.warpPerspective(srcRGBA, uv, H, new cv.Size(UV_W, UV_H), cv.INTER_LINEAR, cv.BORDER_REPLICATE);
+    cv.warpPerspective(srcRGBA, uv, H, new cv.Size(outW, outH), cv.INTER_LINEAR, cv.BORDER_REPLICATE);
     srcTri.delete(); dstTri.delete(); H.delete();
     return uv;
+  }
+
+  /** Rectify the document into UV analysis space. Returns a new RGBA Mat (UV_W x UV_H). */
+  function rectify(srcRGBA, corners) {
+    return rectifyTo(srcRGBA, corners, UV_W, UV_H);
   }
 
   /**
@@ -380,7 +409,7 @@
 
   return {
     init, CONFIG, ZONES, UV_W, UV_H, DOC_W_MM, DOC_H_MM,
-    orderCorners, detectQuad, rectify, analyzeGlare, analyzeSharpness,
+    orderCorners, detectQuad, rectify, rectifyTo, analyzeGlare, analyzeSharpness,
     estimatePose, Atlas, zoneAt, coach,
   };
 }));

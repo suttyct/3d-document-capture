@@ -32,6 +32,7 @@ const state = {
   atlas: null,
   pose: null,
   bestFrame: { score: -1, canvas: null },
+  bestHi: { score: -1, canvas: null, lastCapMs: 0 },
   glareZones: [],
   glareCounters: {},       // per-zone hysteresis counters
   coachMsg: { code: 'show', text: 'Show your ID.' },
@@ -55,6 +56,10 @@ const TUNE = {
   coachMinShowMs: 1200,    // minimum time a shown message stays up
   glareOn: 3, glareCap: 6, // zone glare hysteresis counter thresholds
   analyzeEvery: 2,         // heavy UV analysis every Nth frame
+  roiMargin: 0.3,          // tracking ROI margin around last quad (fraction of bbox)
+  hiResScale: 4,           // final capture raster = 4x analysis UV (1712x1080)
+  hiResMinIntervalMs: 400, // don't re-capture hi-res more often than this
+  hiResMotionMax: 0.012,   // only hi-res capture when nearly still (avoid blur)
 };
 
 // ---------- boot ----------
@@ -218,9 +223,35 @@ function quadCenter(c) {
   return { x: (c[0].x + c[1].x + c[2].x + c[3].x) / 4, y: (c[0].y + c[1].y + c[2].y + c[3].y) / 4 };
 }
 
+/** Detect-then-track: when we know where the card was, search only a padded
+ *  region around it — far more stable (no competing rectangles) and faster.
+ *  Falls back to full-frame when the ROI misses. */
+function detectTracked(src) {
+  if (!state.lastCorners) return P.detectQuad(src);
+  const xs = state.lastCorners.map(p => p.x), ys = state.lastCorners.map(p => p.y);
+  const bx = Math.min(...xs), by = Math.min(...ys);
+  const bw = Math.max(...xs) - bx, bh = Math.max(...ys) - by;
+  const mx = bw * TUNE.roiMargin, my = bh * TUNE.roiMargin;
+  const rx = Math.max(0, Math.round(bx - mx)), ry = Math.max(0, Math.round(by - my));
+  const rw = Math.min(src.cols - rx, Math.round(bw + mx * 2));
+  const rh = Math.min(src.rows - ry, Math.round(bh + my * 2));
+  if (rw < 60 || rh < 40) return P.detectQuad(src);
+  const roi = src.roi(new cv.Rect(rx, ry, rw, rh));
+  // inside the ROI the card dominates: loosen area bounds
+  const cfg = Object.assign({}, P.CONFIG, { minAreaFrac: 0.15, maxAreaFrac: 0.99 });
+  const q = P.detectQuad(roi, cfg);
+  roi.delete();
+  if (q) {
+    q.corners = q.corners.map(p => ({ x: p.x + rx, y: p.y + ry }));
+    q.areaFrac = q.areaFrac * (rw * rh) / (src.cols * src.rows);
+    return q;
+  }
+  return P.detectQuad(src); // ROI miss — one full-frame attempt
+}
+
 function processFrame(src) {
   state.frameCount++;
-  let quad = P.detectQuad(src);
+  let quad = detectTracked(src);
 
   // competing-contour filter: while locked, a quad that teleports far away is
   // probably a different rectangle in the scene — ignore unless it persists
@@ -309,6 +340,17 @@ function processFrame(src) {
       cv.imshow(c, uv);
       state.bestFrame.canvas = c;
     }
+    // the deliverable: re-rectify from the FULL-resolution camera frame
+    // (analysis runs downscaled; the capture must not)
+    const now = performance.now();
+    if (score > state.bestHi.score * 1.02
+        && motion < TUNE.hiResMotionMax
+        && now - state.bestHi.lastCapMs > TUNE.hiResMinIntervalMs) {
+      const hi = captureHiRes(quad.corners);
+      if (hi) {
+        state.bestHi = { score, canvas: hi, lastCapMs: now };
+      }
+    }
 
     const msg = P.coach({ quad, pose: state.pose, glare, sharp, atlas: state.atlas, motion });
     // suppress glare coaching unless the zone passed hysteresis
@@ -340,6 +382,38 @@ function updateCoach(code, text) {
   }
 }
 
+/** Rectify the document from the native-resolution source into a hi-res raster. */
+function captureHiRes(procCorners) {
+  try {
+    let source, sw, sh;
+    if (state.mode === 'demo') {
+      source = state.demo.canvas; sw = source.width; sh = source.height;
+    } else {
+      source = els.video; sw = source.videoWidth; sh = source.videoHeight;
+      if (!sw) return null;
+    }
+    const k = sw / state.procW; // processing space -> native space
+    const corners = procCorners.map(p => ({ x: p.x * k, y: p.y * k }));
+    if (!work.hiCap || work.hiCap.width !== sw) {
+      work.hiCap = document.createElement('canvas');
+      work.hiCap.width = sw; work.hiCap.height = sh;
+      work.hiCtx = work.hiCap.getContext('2d', { willReadFrequently: true });
+    }
+    work.hiCtx.drawImage(source, 0, 0, sw, sh);
+    const full = cv.matFromImageData(work.hiCtx.getImageData(0, 0, sw, sh));
+    const outW = P.UV_W * TUNE.hiResScale, outH = P.UV_H * TUNE.hiResScale;
+    const uv = P.rectifyTo(full, corners, outW, outH);
+    const c = document.createElement('canvas');
+    c.width = outW; c.height = outH;
+    cv.imshow(c, uv);
+    full.delete(); uv.delete();
+    return c;
+  } catch (e) {
+    console.warn('hi-res capture failed', e);
+    return null;
+  }
+}
+
 function complete() {
   state.phase = 'COMPLETE';
   els.coach.classList.remove('show');
@@ -347,10 +421,16 @@ function complete() {
   const secs = ((performance.now() - state.t0) / 1000).toFixed(1);
   els.status.textContent = `Captured in ${secs}s`;
   document.body.classList.add('complete');
-  if (state.bestFrame.canvas) {
+  // final attempt at a fresh hi-res grab at the moment of completion
+  if (state.lastCorners) {
+    const hi = captureHiRes(state.lastCorners);
+    if (hi && state.bestHi.score < 0) state.bestHi = { score: 0, canvas: hi, lastCapMs: performance.now() };
+  }
+  const artifact = state.bestHi.canvas || state.bestFrame.canvas;
+  if (artifact) {
     els.doneThumb.innerHTML = '';
-    state.bestFrame.canvas.classList.add('rectified');
-    els.doneThumb.appendChild(state.bestFrame.canvas);
+    artifact.classList.add('rectified');
+    els.doneThumb.appendChild(artifact);
   }
   setTimeout(() => {
     els.donePane.classList.remove('hidden');
