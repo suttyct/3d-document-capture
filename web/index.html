@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+<title>3D Document Capture — Live Prototype</title>
+<style>
+  :root{ --teal:#39e6c3; --amber:#ffb347; --bg:#0b0f14; }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;overflow:hidden}
+  body{background:var(--bg);color:#eaf4f2;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display",Inter,Segoe UI,Roboto,sans-serif}
+
+  .stage{position:fixed;inset:0}
+  video,#overlay{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  #overlay{z-index:10}
+
+  .hidden{display:none !important}
+
+  /* start pane */
+  #startPane{position:fixed;inset:0;z-index:50;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;
+    background:radial-gradient(900px 600px at 50% 20%, #16202b, var(--bg))}
+  #startPane h1{font-size:20px;font-weight:700;letter-spacing:.02em}
+  #startPane p{max-width:340px;text-align:center;font-size:13.5px;line-height:1.6;color:#8fa6b5}
+  #startPane button{font-family:inherit;font-size:16px;font-weight:650;padding:14px 34px;border-radius:99px;cursor:pointer;
+    border:1px solid var(--teal);background:rgba(57,230,195,.13);color:var(--teal);transition:all .2s ease}
+  #startPane button:hover{background:rgba(57,230,195,.25)}
+  #startPane button:disabled{opacity:.45;cursor:default}
+  #startPane .alt{border-color:rgba(255,255,255,.2);background:rgba(255,255,255,.05);color:#9fb3c8;font-size:13.5px;padding:10px 22px}
+
+  /* HUD */
+  #hud{position:fixed;inset:0;z-index:20;pointer-events:none}
+  .statusPill{position:absolute;top:calc(env(safe-area-inset-top, 0px) + 18px);left:50%;transform:translateX(-50%);
+    display:flex;align-items:center;gap:8px;background:rgba(10,14,18,.6);backdrop-filter:blur(14px);
+    border:1px solid rgba(255,255,255,.09);padding:8px 16px;border-radius:99px;
+    font-size:12.5px;font-weight:600;letter-spacing:.04em;color:#cfe7e1;white-space:nowrap}
+  .dot{width:7px;height:7px;border-radius:50%;background:#5b6b7a;transition:all .3s ease;flex:none}
+  .dot.teal{background:var(--teal);box-shadow:0 0 8px var(--teal)}
+  .dot.amber{background:var(--amber);box-shadow:0 0 8px var(--amber)}
+
+  #coach{position:absolute;left:50%;bottom:calc(env(safe-area-inset-bottom, 0px) + 64px);transform:translateX(-50%) translateY(8px);
+    background:rgba(10,14,18,.62);backdrop-filter:blur(16px);border:1px solid rgba(255,255,255,.1);
+    padding:13px 26px;border-radius:18px;font-size:18px;font-weight:650;color:#fff;white-space:nowrap;
+    opacity:0;transition:all .4s cubic-bezier(.2,.9,.3,1)}
+  #coach.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  #coach.glareMsg{border-color:rgba(255,179,71,.5)}
+
+  #metrics{position:absolute;left:50%;bottom:calc(env(safe-area-inset-bottom, 0px) + 18px);transform:translateX(-50%);
+    font-size:10.5px;letter-spacing:.06em;color:rgba(143,166,181,.75);font-family:ui-monospace,Menlo,monospace;white-space:nowrap}
+
+  /* completion pane */
+  #donePane{position:fixed;inset:0;z-index:60;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px;
+    background:radial-gradient(640px 520px at 50% 35%, rgba(20,60,52,.96), rgba(8,12,16,.98))}
+  .bigTick{width:88px;height:88px;border-radius:50%;border:2.5px solid var(--teal);display:flex;align-items:center;justify-content:center;
+    background:radial-gradient(circle at 35% 30%, rgba(57,230,195,.25), rgba(57,230,195,.06));
+    box-shadow:0 0 44px rgba(57,230,195,.4);animation:pop .6s cubic-bezier(.2,1.5,.4,1) both}
+  @keyframes pop{from{transform:scale(.4);opacity:0}to{transform:scale(1);opacity:1}}
+  .bigTick svg{width:40px;height:40px}
+  #donePane h2{font-size:22px;font-weight:700}
+  #donePane .sub{font-size:12.5px;color:#8fc7b8;letter-spacing:.03em}
+  #doneThumb{border-radius:10px;overflow:hidden;box-shadow:0 14px 40px rgba(0,0,0,.6),0 0 0 2px rgba(57,230,195,.55);line-height:0}
+  #doneThumb canvas{width:min(78vw, 380px);height:auto}
+  #restartBtn{font-family:inherit;font-size:14px;font-weight:600;padding:11px 26px;border-radius:99px;cursor:pointer;
+    border:1px solid rgba(255,255,255,.22);background:rgba(255,255,255,.06);color:#cfe7e1}
+
+  .loadNote{font-size:11.5px;color:#5b6b7a}
+</style>
+</head>
+<body>
+  <div class="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div id="startPane">
+    <h1>3D Document Capture</h1>
+    <p>Live computer-vision prototype: document detection, pose, and glare/blur localized to document zones — all on-device, in your browser. Use a card-sized document (any card works for the geometry demo).</p>
+    <button id="startBtn" disabled>Loading OpenCV…</button>
+    <button id="demoBtn" class="alt" disabled>Run demo mode (no camera)</button>
+    <span class="loadNote">~10 MB WASM, loads once</span>
+  </div>
+
+  <div id="hud" class="hidden">
+    <div class="statusPill"><span class="dot" id="statusDot"></span><span id="status">Looking for a document…</span></div>
+    <div id="coach"></div>
+    <div id="metrics"></div>
+  </div>
+
+  <div id="donePane" class="hidden">
+    <div class="bigTick"><svg viewBox="0 0 40 40"><path d="M9 21 L17 30 L31 11" stroke="#39e6c3" stroke-width="4" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+    <h2>Captured</h2>
+    <div class="sub">All critical zones seen sharp and glare-free</div>
+    <div id="doneThumb"></div>
+    <button id="restartBtn">Capture again</button>
+  </div>
+
+  <div id="thumb" class="hidden"><img id="thumbImg" alt=""></div>
+
+  <script src="vendor/opencv.js"></script>
+  <script src="js/pipeline.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

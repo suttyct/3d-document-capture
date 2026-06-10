@@ -1,0 +1,6 @@
+{
+  "name": "doc-capture-pipeline-tests",
+  "private": true,
+  "scripts": { "test": "node pipeline.test.js" },
+  "dependencies": { "@techstark/opencv-js": "^4.11.0" }
+}

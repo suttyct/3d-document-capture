@@ -21,6 +21,18 @@ Today's capture SDKs treat the camera feed as a stream of flat pictures and emit
 | [docs/03-ux-blueprint.md](docs/03-ux-blueprint.md) | The "25th-century" capture experience: choreography, AR overlay language, coaching grammar, haptics/sound, accessibility, fallbacks, and success metrics. |
 | [docs/04-risks-and-open-questions.md](docs/04-risks-and-open-questions.md) | Patent landscape, unverified claims to re-check, technical risks, and the proposed proof-of-concept sequence. |
 | [mockup/index.html](mockup/index.html) | High-fidelity animated prototype of the capture experience (self-contained HTML — open in any browser; auto-plays all seven scenes, or step through them). Rendered stills in [mockup/shots/](mockup/shots/). |
+| [web/](web/) | **Working prototype with real computer vision** — document quad detection, sub-pixel corners, 6DoF pose (PnP), glare/blur masks localized to document zones, quality atlas, live coaching. Runs fully on-device in the browser (OpenCV WASM). |
+| [test/](test/) | Headless pipeline test suite: synthetic card frames at known ground-truth homographies verify detection accuracy (±2.5 px), pose direction, zone-level glare localization, sharpness gating, and atlas completion. `cd test && npm install && npm test`. |
+
+## Running the working prototype
+
+```bash
+cd web && python3 -m http.server 8080
+# open http://localhost:8080  →  "Start camera" (or "Run demo mode")
+```
+
+- **On a phone**, the camera requires HTTPS: host `web/` on any static HTTPS host (GitHub Pages works), or tunnel localhost. Without a camera, **demo mode** (`?demo=1`) runs the identical pipeline on a synthetic moving card with traveling glare — it locks on, flags "Glare over MRZ zone", coaches the tilt, and completes with a rectified capture.
+- Pipeline status: classic-CV implementation (Canny quad + cornerSubPix + IPPE PnP + HSV glare + Laplacian sharpness) at ~30 ms/frame headless. Known limitation, by design: threshold-based glare cannot separate blown-out white print from specular glare — the production path is the small glare CNN identified in the research (Rodin et al., ~24 ms on phone). Detection is the next component to upgrade (LDRNet-style corner net).
 
 ## Headline design decisions (detailed in the docs)
 
