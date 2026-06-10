@@ -43,6 +43,8 @@
     glareSatMax: 60,           // HSV S threshold
     glareZoneFracBad: 0.04,    // zone is "glared" if > 4% of its pixels glare
     sharpZoneMin: 150,         // Laplacian variance threshold per zone (calibrated by tests)
+    sharpAbsMin: 40,           // atlas: absolute floor for a zone to ever count as sharp
+    sharpRelFrac: 0.3,         // atlas: zone is sharp if score > rel-frac of best seen for that zone
     atlasCols: 16, atlasRows: 10,
     atlasGlareCellFrac: 0.06,  // cell glared if >6% pixels glare
     focalFovDeg: 68,           // assumed horizontal FOV when intrinsics unknown
@@ -288,17 +290,32 @@
     return out;
   }
 
-  /** Quality atlas: per-UV-cell accumulator across frames. */
+  /** Quality atlas: per-UV-cell accumulator across frames.
+   *  Sharpness gating is adaptive: a zone counts as sharp relative to the
+   *  best score seen for that zone this session (self-calibrates to the
+   *  device/lighting instead of trusting absolute thresholds). */
   class Atlas {
     constructor(cfg = CONFIG) {
       this.cfg = cfg;
       this.cols = cfg.atlasCols; this.rows = cfg.atlasRows;
       this.cells = new Array(this.cols * this.rows).fill(0); // 0=unseen,1=clean
       this.zoneState = {};
-      for (const name of Object.keys(ZONES)) this.zoneState[name] = { clean: false };
+      this.zoneMax = {};
+      for (const name of Object.keys(ZONES)) {
+        this.zoneState[name] = { clean: false };
+        this.zoneMax[name] = 0;
+      }
+    }
+    zoneSharp(name, sharp) {
+      const score = sharp.perZone[name].score;
+      if (score > this.zoneMax[name]) this.zoneMax[name] = score;
+      const thr = Math.max(this.cfg.sharpAbsMin, this.cfg.sharpRelFrac * this.zoneMax[name]);
+      return score >= thr;
     }
     /** Update from one frame's UV analyses. glare.mask must still be alive. */
     update(glare, sharp) {
+      const zoneSharpNow = {};
+      for (const name of Object.keys(ZONES)) zoneSharpNow[name] = this.zoneSharp(name, sharp);
       const cw = UV_W / this.cols, ch = UV_H / this.rows;
       for (let r = 0; r < this.rows; r++) {
         for (let c = 0; c < this.cols; c++) {
@@ -312,7 +329,7 @@
             // cell zone sharpness: use the zone the cell center falls into
             const u = (c + 0.5) / this.cols, v = (r + 0.5) / this.rows;
             const zname = zoneAt(u, v);
-            const zsharp = zname ? sharp.perZone[zname].sharp : sharp.overall >= this.cfg.sharpZoneMin;
+            const zsharp = zname ? zoneSharpNow[zname] : sharp.overall >= this.cfg.sharpAbsMin;
             if (zsharp) this.cells[i] = 1;
           }
         }

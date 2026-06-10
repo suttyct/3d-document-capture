@@ -26,16 +26,35 @@ const state = {
   corners: null,           // smoothed corners (display space)
   lastCorners: null,
   stableFrames: 0,
+  lostFrames: 0,           // consecutive frames without an acceptable quad
+  jumpFrames: 0,           // consecutive frames where the quad jumped far away
+  pendingJump: null,       // candidate far-away quad (competing contour filter)
   atlas: null,
   pose: null,
   bestFrame: { score: -1, canvas: null },
   glareZones: [],
+  glareCounters: {},       // per-zone hysteresis counters
   coachMsg: { code: 'show', text: 'Show your ID.' },
+  coachCandidate: { code: null, frames: 0 },
+  coachShownAt: 0,
   frameCount: 0,
   t0: 0,
   procW: 0, procH: 0,      // processing frame size
   demo: null,
   lastInferMs: 0,
+};
+
+// stability tuning (real-device feel)
+const TUNE = {
+  maxProcWidth: 960,       // downscale capture for processing (phone perf)
+  lockFrames: 6,           // stable frames before LOCKED
+  graceFrames: 12,         // keep outline through this many missed detections
+  jumpFrac: 0.18,          // quad center jump > this fraction of width = suspect
+  jumpConfirm: 5,          // frames a far-away quad must persist to win
+  coachConfirmFrames: 7,   // frames a new message must persist before showing
+  coachMinShowMs: 1200,    // minimum time a shown message stays up
+  glareOn: 3, glareCap: 6, // zone glare hysteresis counter thresholds
+  analyzeEvery: 2,         // heavy UV analysis every Nth frame
 };
 
 // ---------- boot ----------
@@ -158,15 +177,18 @@ function drawDemoFrame() {
 const work = { src: null, cap: null };
 
 function grabFrame() {
-  let w, h, source;
+  let sw, sh, source;
   if (state.mode === 'demo') {
     source = drawDemoFrame();
-    w = source.width; h = source.height;
+    sw = source.width; sh = source.height;
   } else {
     source = els.video;
-    w = source.videoWidth; h = source.videoHeight;
-    if (!w) return null;
+    sw = source.videoWidth; sh = source.videoHeight;
+    if (!sw) return null;
   }
+  // downscale for processing — full-res getImageData murders phone frame rates
+  const scale = Math.min(1, TUNE.maxProcWidth / sw);
+  const w = Math.round(sw * scale), h = Math.round(sh * scale);
   if (!work.cap || work.cap.width !== w) {
     work.cap = document.createElement('canvas');
     work.cap.width = w; work.cap.height = h;
@@ -192,9 +214,28 @@ function loop() {
   requestAnimationFrame(loop);
 }
 
+function quadCenter(c) {
+  return { x: (c[0].x + c[1].x + c[2].x + c[3].x) / 4, y: (c[0].y + c[1].y + c[2].y + c[3].y) / 4 };
+}
+
 function processFrame(src) {
   state.frameCount++;
-  const quad = P.detectQuad(src);
+  let quad = P.detectQuad(src);
+
+  // competing-contour filter: while locked, a quad that teleports far away is
+  // probably a different rectangle in the scene — ignore unless it persists
+  if (quad && state.corners && state.phase === 'LOCKED') {
+    const jump = Math.hypot(
+      quadCenter(quad.corners).x - quadCenter(state.corners).x,
+      quadCenter(quad.corners).y - quadCenter(state.corners).y) / state.procW;
+    if (jump > TUNE.jumpFrac) {
+      state.jumpFrames++;
+      if (state.jumpFrames < TUNE.jumpConfirm) quad = null; // treat as miss (grace below keeps outline)
+      else { state.corners = quad.corners.map(p => ({ ...p })); state.jumpFrames = 0; }
+    } else {
+      state.jumpFrames = 0;
+    }
+  }
 
   // motion = mean corner displacement / frame width
   let motion = 0;
@@ -205,44 +246,58 @@ function processFrame(src) {
     }
     motion /= 4 * state.procW;
   }
-  state.lastCorners = quad ? quad.corners : null;
+  if (quad) state.lastCorners = quad.corners;
 
   if (!quad) {
     state.stableFrames = 0;
-    if (state.phase === 'LOCKED') state.phase = 'SEARCHING';
-    state.corners = null;
-    state.coachMsg = P.coach({ quad: null });
+    state.lostFrames++;
+    // grace period: hold the outline through brief detection dropouts
+    if (state.lostFrames > TUNE.graceFrames) {
+      if (state.phase === 'LOCKED') state.phase = 'SEARCHING';
+      state.corners = null;
+      state.lastCorners = null;
+      updateCoach('show', 'Show your ID.');
+    }
     return;
   }
+  state.lostFrames = 0;
 
-  // exponential smoothing for display corners
+  // adaptive smoothing: heavy damping at rest, responsive during motion
   if (!state.corners) state.corners = quad.corners.map(p => ({ ...p }));
   else {
-    const a = 0.45;
+    const a = Math.min(0.6, Math.max(0.15, 0.15 + motion * 6));
     for (let i = 0; i < 4; i++) {
       state.corners[i].x += a * (quad.corners[i].x - state.corners[i].x);
       state.corners[i].y += a * (quad.corners[i].y - state.corners[i].y);
     }
   }
 
-  state.stableFrames = motion < 0.02 ? state.stableFrames + 1 : 0;
-  if (state.phase === 'SEARCHING' && state.stableFrames >= 4) {
+  state.stableFrames = motion < 0.025 ? state.stableFrames + 1 : 0;
+  if (state.phase === 'SEARCHING' && state.stableFrames >= TUNE.lockFrames) {
     state.phase = 'LOCKED';
     haptic(30);
   }
 
-  // full analysis only when locked (and every frame — preview-res is cheap)
-  let glare = null, sharp = null;
-  if (state.phase === 'LOCKED') {
+  // heavy UV analysis only when locked, and only every Nth frame
+  if (state.phase === 'LOCKED' && state.frameCount % TUNE.analyzeEvery === 0) {
     const uv = P.rectify(src, quad.corners);
-    glare = P.analyzeGlare(uv);
-    sharp = P.analyzeSharpness(uv);
+    const glare = P.analyzeGlare(uv);
+    const sharp = P.analyzeSharpness(uv);
     state.pose = P.estimatePose(quad.corners, state.procW, state.procH);
     state.atlas.update(glare, sharp);
 
-    state.glareZones = Object.entries(glare.perZone)
-      .filter(([n, z]) => z.glared && P.ZONES[n].critical && !state.atlas.zoneState[n].clean)
-      .map(([n]) => n);
+    // per-zone glare hysteresis: a zone must be glared in several recent
+    // frames to surface, and clear for several to disappear
+    for (const [n, z] of Object.entries(glare.perZone)) {
+      const cnt = state.glareCounters[n] || 0;
+      state.glareCounters[n] = z.glared
+        ? Math.min(TUNE.glareCap, cnt + 1)
+        : Math.max(0, cnt - 1);
+    }
+    state.glareZones = Object.keys(P.ZONES)
+      .filter(n => P.ZONES[n].critical
+        && (state.glareCounters[n] || 0) >= TUNE.glareOn
+        && !state.atlas.zoneState[n].clean);
 
     // best-frame tracking: prefer frames with no critical glare + max sharpness
     const criticalGlare = Object.entries(glare.perZone).some(([n, z]) => z.glared && P.ZONES[n].critical);
@@ -255,15 +310,33 @@ function processFrame(src) {
       state.bestFrame.canvas = c;
     }
 
-    state.coachMsg = P.coach({ quad, pose: state.pose, glare, sharp, atlas: state.atlas, motion });
+    const msg = P.coach({ quad, pose: state.pose, glare, sharp, atlas: state.atlas, motion });
+    // suppress glare coaching unless the zone passed hysteresis
+    if (msg.code === 'glare' && !state.glareZones.includes(msg.zone)) updateCoach('ok', '');
+    else updateCoach(msg.code, msg.text);
     glare.mask.delete();
     uv.delete();
 
     if (state.atlas.criticalComplete && state.atlas.fillFrac > 0.9) {
       complete();
     }
-  } else {
-    state.coachMsg = P.coach({ quad, motion });
+  } else if (state.phase !== 'LOCKED') {
+    const msg = P.coach({ quad, motion });
+    updateCoach(msg.code, msg.text);
+  }
+}
+
+/** Debounced coaching: a new message must persist before it shows, and a
+ *  shown message stays up a minimum time — no flapping. */
+function updateCoach(code, text) {
+  if (code === state.coachMsg.code) { state.coachCandidate = { code: null, frames: 0 }; return; }
+  if (state.coachCandidate.code === code) state.coachCandidate.frames++;
+  else state.coachCandidate = { code, text, frames: 1 };
+  const shownLongEnough = performance.now() - state.coachShownAt > TUNE.coachMinShowMs;
+  if (state.coachCandidate.frames >= TUNE.coachConfirmFrames && shownLongEnough) {
+    state.coachMsg = { code, text };
+    state.coachShownAt = performance.now();
+    state.coachCandidate = { code: null, frames: 0 };
   }
 }
 
